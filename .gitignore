@@ -1,0 +1,22 @@
+# Dependencias y build (se regeneran)
+node_modules/
+dist/
+
+# Configuración local con posibles claves: copiar desde .env.example
+server/.env
+
+# Logs y temporales
+*.log
+.opencode/
+
+# Avatares .vrm (71 MB) y voces Piper (245 MB): no se suben.
+# Cada uno los pone en local (ver README: "Añadir avatares" y "Voces").
+public/models/*.vrm
+server/voices/*
+!server/voices/.gitkeep
+
+# Sistema / editores
+.DS_Store
+Thumbs.db
+.vscode/
+*.zip
