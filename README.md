@@ -7,6 +7,11 @@ La colega virtual que lo sabe casi todo: avatar 3D expresivo con el que hablas p
 </p>
 
 
+<p align="center">
+  <img width="48%" alt="Paseta avatar" src="https://github.com/user-attachments/assets/f82bf9f0-6401-47dc-8306-0701ebef5789" />
+  <img width="48%" alt="Paseta chat" src="https://github.com/user-attachments/assets/e9654838-29fb-49c5-9c55-b1138e2f35a1" />
+</p>
+
 ![stack](https://img.shields.io/badge/three.js-VRM-blue) ![pwa](https://img.shields.io/badge/PWA-instalable-green) ![ia](https://img.shields.io/badge/IA-Ollama_%2F_OpenAI-orange)
 
 ---
