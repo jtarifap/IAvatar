@@ -2,6 +2,7 @@
 
 La colega virtual que lo sabe casi todo: avatar 3D expresivo con el que hablas por **texto o por voz**, con IA local (gratis) o cloud, y voz propia offline. Instalable como app (PWA) en PC y Android.
 <img width="625" height="677" alt="image" src="https://github.com/user-attachments/assets/f82bf9f0-6401-47dc-8306-0701ebef5789" />
+<img width="623" height="683" alt="image" src="https://github.com/user-attachments/assets/e9654838-29fb-49c5-9c55-b1138e2f35a1" />
 
 
 ![stack](https://img.shields.io/badge/three.js-VRM-blue) ![pwa](https://img.shields.io/badge/PWA-instalable-green) ![ia](https://img.shields.io/badge/IA-Ollama_%2F_OpenAI-orange)
