@@ -4,6 +4,8 @@ dist/
 
 # Configuración local con posibles claves: copiar desde .env.example
 server/.env
+# Perfiles cloud locales (sin claves, pero configuración personal)
+server/cloud-profiles.json
 
 # Logs y temporales
 *.log

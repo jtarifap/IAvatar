@@ -7,7 +7,7 @@
 // - La API del backend y el chat nunca se cachean.
 // - Sube CACHE_VERSION para forzar actualización.
 
-const CACHE_VERSION = 'paseta-v1';
+const CACHE_VERSION = 'paseta-v2';
 
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;

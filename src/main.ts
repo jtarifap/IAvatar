@@ -2,9 +2,26 @@ import * as THREE from 'three';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { chat, getApiBase, getConfig, listOllamaModels, setApiBase, setConfig, type ChatMessage } from './ai/client.js';
+import { chat, createCloudProfile, deleteCloudProfile, formatCost, getApiBase, getConfig, listCloudModels, listOllamaModels, setActiveProfile, setApiBase, setConfig, testCloud, updateCloudProfile, type ChatMessage, type CloudProfile } from './ai/client.js';
 import { backendVoiceActive, fetchTtsVoices, getVoiceLevel, playBackendVoice, stopBackendVoice, type TtsVoice } from './voice/tts.js';
 import { HELP_SECTIONS, CONTACT } from './help/content.js';
+import {
+    fetchEffects,
+    getCachedEffects,
+    extractDanceCommand,
+    type DanceEffect
+} from './motion/effectsCatalog.js';
+import {
+    attachDanceVrm,
+    cancelDance,
+    playDance,
+    updateDance,
+    isDancing,
+    currentDanceLabel,
+    setDanceEndListener
+} from './motion/dancePlayer.js';
+import { isFbxFile, loadFbxRig } from './motion/avatarRig.js';
+import { startIdleLoop, stopIdleLoop, updateIdleLoop } from './motion/idleLoop.js';
 
 // ======================================================
 // APP
@@ -117,7 +134,8 @@ controls.update();
 // sin dar nunca la vuelta completa.
 let lastCameraInteraction = -10;
 const SWAY_RESUME_DELAY = 4;
-const SWAY_BASE_YAW = Math.PI;
+let avatarBaseYaw = Math.PI;
+let avatarFz: -1 | 1 = -1; // hacia dónde mira el modelo en su espacio local
 const SWAY_AMPLITUDE = THREE.MathUtils.degToRad(28);
 const SWAY_SPEED = 0.22;
 
@@ -708,6 +726,7 @@ function setTheme(dark: boolean) {
     }
 
     refreshMoodButtons();
+    refreshDanceUI();
 
     if (typeof refreshAvatarButtons !== 'undefined') {
         refreshAvatarButtons();
@@ -1015,6 +1034,10 @@ function clearExpressions() {
 
 function applyMood(mood: string | null) {
 
+    // Una expresión elegida (o re-aplicada) cancela la
+    // vuelta a neutral pendiente, si la había.
+    cancelNeutralFaceTimer();
+
     activeMood = mood;
 
     clearExpressions();
@@ -1036,6 +1059,47 @@ function applyMood(mood: string | null) {
     } catch {
         // Expresión no definida en este modelo: ignorar.
     }
+}
+
+// ======================================================
+// VUELTA A NEUTRAL (3 s después de terminar de hablar)
+// ======================================================
+// Cuando el avatar termina de decir el texto, la cara
+// vuelve sola a neutral pasados 3 segundos. Si empieza
+// otra frase o se elige una expresión manual, el
+// temporizador se cancela (ver applyMood / speak).
+
+const NEUTRAL_FACE_DELAY_MS = 3000;
+
+let neutralFaceTimer: ReturnType<typeof setTimeout> | null =
+    null;
+
+function cancelNeutralFaceTimer() {
+
+    if (neutralFaceTimer !== null) {
+        clearTimeout(neutralFaceTimer);
+        neutralFaceTimer = null;
+    }
+}
+
+function scheduleNeutralFace() {
+
+    cancelNeutralFaceTimer();
+
+    neutralFaceTimer = setTimeout(
+        () => {
+            neutralFaceTimer = null;
+
+            // Si empezó a hablar de nuevo, no tocar la cara.
+            if (currentStatus === 'speaking') {
+                return;
+            }
+
+            applyMood(null);
+            refreshMoodButtons();
+        },
+        NEUTRAL_FACE_DELAY_MS
+    );
 }
 
 // ======================================================
@@ -1240,9 +1304,10 @@ moodPanel.style.position = 'absolute';
 moodPanel.style.left = '30px';
 moodPanel.style.bottom = '95px';
 moodPanel.style.display = 'none';
-moodPanel.style.flexWrap = 'wrap';
-moodPanel.style.gap = '6px';
+moodPanel.style.flexDirection = 'column';
+moodPanel.style.gap = '8px';
 moodPanel.style.maxWidth = '320px';
+moodPanel.style.minWidth = '260px';
 moodPanel.style.padding = '10px';
 moodPanel.style.borderRadius = '16px';
 moodPanel.style.background = 'rgba(0,0,0,0.55)';
@@ -1254,6 +1319,338 @@ function setMoodPanelVisible(visible: boolean) {
     moodPanel.style.display = visible ? 'flex' : 'none';
     plusButton.style.transform = visible ? 'rotate(45deg)' : 'none';
 }
+
+// ------------------------------------------------------
+// PESTAÑAS DEL PANEL + (Expresiones / Bailes / ...)
+// ------------------------------------------------------
+
+type PlusTab = 'mood' | 'dance';
+
+let plusTab: PlusTab = 'mood';
+
+const tabBar =
+    document.createElement('div');
+
+tabBar.style.display = 'flex';
+tabBar.style.gap = '6px';
+
+moodPanel.appendChild(
+    tabBar
+);
+
+function styleTabButton(
+    button: HTMLButtonElement,
+    selected: boolean
+) {
+
+    button.style.flex = '1 1 auto';
+    button.style.padding = '7px 6px';
+    button.style.borderRadius = '12px';
+    button.style.fontSize = '13px';
+    button.style.cursor = 'pointer';
+
+    if (isDarkTheme) {
+
+        button.style.background = selected
+            ? 'rgba(255,255,255,0.9)'
+            : 'transparent';
+        button.style.color = selected
+            ? '#111827'
+            : 'white';
+        button.style.border =
+            '1px solid rgba(255,255,255,0.25)';
+
+    } else {
+
+        button.style.background = selected
+            ? '#111827'
+            : 'transparent';
+        button.style.color = selected
+            ? 'white'
+            : '#111827';
+        button.style.border =
+            '1px solid rgba(0,0,0,0.18)';
+    }
+}
+
+const tabMoodButton =
+    document.createElement('button');
+
+tabMoodButton.type = 'button';
+tabMoodButton.textContent = '😊 Expresiones';
+tabMoodButton.title = 'Expresiones de la cara';
+tabMoodButton.setAttribute('aria-label', 'Pestaña expresiones');
+
+tabMoodButton.addEventListener(
+    'click',
+    () => {
+        setPlusTab('mood');
+        textInput.focus();
+    }
+);
+
+tabBar.appendChild(
+    tabMoodButton
+);
+
+const tabDanceButton =
+    document.createElement('button');
+
+tabDanceButton.type = 'button';
+tabDanceButton.textContent = '💃 Bailes';
+tabDanceButton.title = 'Bailes (carpeta efects)';
+tabDanceButton.setAttribute('aria-label', 'Pestaña bailes');
+
+tabDanceButton.addEventListener(
+    'click',
+    () => {
+        setPlusTab('dance');
+        void refreshDanceList();
+        textInput.focus();
+    }
+);
+
+// PESTAÑA BAILES DESACTIVADA temporalmente (el baile no
+// quedaba natural). Para reactivarla, descomentar estas
+// tres líneas y el bloque 3) de sendQuestion.
+// tabBar.appendChild(
+//     tabDanceButton
+// );
+
+// Contenedor de expresiones (los botones de MOODS
+// se crean más abajo dentro de este contenedor).
+const moodGrid =
+    document.createElement('div');
+
+moodGrid.style.display = 'flex';
+moodGrid.style.flexWrap = 'wrap';
+moodGrid.style.gap = '6px';
+
+moodPanel.appendChild(
+    moodGrid
+);
+
+// ------------------------------------------------------
+// PESTAÑA BAILES (lista viva de public/efects)
+// ------------------------------------------------------
+
+const dancePane =
+    document.createElement('div');
+
+dancePane.style.display = 'none';
+dancePane.style.flexDirection = 'column';
+dancePane.style.gap = '6px';
+
+moodPanel.appendChild(
+    dancePane
+);
+
+const danceStatus =
+    document.createElement('div');
+
+danceStatus.style.fontSize = '12px';
+danceStatus.style.opacity = '0.75';
+danceStatus.style.color = 'white';
+danceStatus.textContent = 'Bailes de la carpeta efects.';
+
+dancePane.appendChild(
+    danceStatus
+);
+
+const danceList =
+    document.createElement('div');
+
+danceList.style.display = 'flex';
+danceList.style.flexWrap = 'wrap';
+danceList.style.gap = '6px';
+
+dancePane.appendChild(
+    danceList
+);
+
+const stopDanceButton =
+    document.createElement('button');
+
+stopDanceButton.type = 'button';
+stopDanceButton.textContent = '⏹ Detener baile';
+stopDanceButton.title = 'Detiene el baile y vuelve a la pose inicial';
+stopDanceButton.setAttribute('aria-label', 'Detener baile');
+stopDanceButton.style.display = 'none';
+stopDanceButton.style.padding = '8px 12px';
+stopDanceButton.style.borderRadius = '18px';
+stopDanceButton.style.fontSize = '13px';
+stopDanceButton.style.cursor = 'pointer';
+stopDanceButton.style.border = '1px solid rgba(239,68,68,0.6)';
+stopDanceButton.style.background = 'rgba(239,68,68,0.2)';
+stopDanceButton.style.color = 'white';
+
+stopDanceButton.addEventListener(
+    'click',
+    () => {
+        cancelDance();
+        refreshDanceUI();
+        textInput.focus();
+    }
+);
+
+dancePane.appendChild(
+    stopDanceButton
+);
+
+const danceButtons: Record<string, HTMLButtonElement> = {};
+
+function styleDanceButton(
+    button: HTMLButtonElement,
+    dancing: boolean
+) {
+
+    button.style.padding = '8px 12px';
+    button.style.borderRadius = '18px';
+    button.style.fontSize = '13px';
+    button.style.cursor = dancing ? 'default' : 'pointer';
+    button.style.opacity = dancing ? '0.45' : '1';
+
+    if (isDarkTheme) {
+
+        button.style.background = 'transparent';
+        button.style.color = 'white';
+        button.style.border =
+            '1px solid rgba(255,255,255,0.25)';
+
+    } else {
+
+        button.style.background = 'transparent';
+        button.style.color = '#111827';
+        button.style.border =
+            '1px solid rgba(0,0,0,0.18)';
+    }
+}
+
+function setPlusTab(tab: PlusTab) {
+
+    plusTab = tab;
+
+    const showDance = tab === 'dance';
+
+    moodGrid.style.display = showDance ? 'none' : 'flex';
+    dancePane.style.display = showDance ? 'flex' : 'none';
+
+    styleTabButton(tabMoodButton, !showDance);
+    styleTabButton(tabDanceButton, showDance);
+}
+
+function refreshDanceUI() {
+
+    const dancing = isDancing();
+
+    stopDanceButton.style.display = dancing ? 'block' : 'none';
+
+    danceStatus.textContent = dancing
+        ? `💃 Bailando: ${currentDanceLabel()}…`
+        : 'Bailes de la carpeta efects. Se reproducen una vez.';
+
+    for (const btn of Object.values(danceButtons)) {
+        styleDanceButton(btn, dancing);
+    }
+
+    styleTabButton(tabMoodButton, plusTab === 'mood');
+    styleTabButton(tabDanceButton, plusTab === 'dance');
+}
+
+async function refreshDanceList() {
+
+    danceStatus.textContent = 'Buscando bailes en efects…';
+    danceStatus.style.color = 'white';
+
+    const effects = await fetchEffects(true);
+
+    danceList.innerHTML = '';
+
+    for (const key of Object.keys(danceButtons)) {
+        delete danceButtons[key];
+    }
+
+    if (!effects.length) {
+        danceStatus.textContent =
+            'No hay bailes en public/efects.';
+        return;
+    }
+
+    for (const effect of effects) {
+
+        const button =
+            document.createElement('button');
+
+        button.type = 'button';
+        button.textContent = `💃 ${effect.label}`;
+        button.title = `Bailar: ${effect.label} (una vez)`;
+        button.setAttribute('aria-label', `Bailar ${effect.label}`);
+
+        styleDanceButton(button, isDancing());
+
+        button.addEventListener(
+            'click',
+            () => {
+                void runDance(effect, button);
+                textInput.focus();
+            }
+        );
+
+        danceButtons[effect.id] = button;
+
+        danceList.appendChild(
+            button
+        );
+    }
+
+    refreshDanceUI();
+}
+
+async function runDance(
+    effect: DanceEffect,
+    fromButton?: HTMLButtonElement
+) {
+
+    if (isDancing()) {
+        return;
+    }
+
+    if (fromButton) {
+        fromButton.textContent = '⏳ Cargando…';
+    }
+
+    messagePanel.textContent =
+        `💃 Bailando: ${effect.label}…`;
+
+    refreshDanceUI();
+
+    try {
+
+        await playDance(effect);
+
+    } catch (err) {
+
+        console.error(err);
+
+        const detail = err instanceof Error
+            ? err.message
+            : 'No se pudo reproducir el baile.';
+
+        messagePanel.textContent = detail;
+
+    } finally {
+
+        if (fromButton) {
+            fromButton.textContent = `💃 ${effect.label}`;
+        }
+
+        refreshDanceUI();
+    }
+}
+
+setDanceEndListener(() => {
+    refreshDanceUI();
+});
 
 const moodButtons: Record<string, HTMLButtonElement> = {};
 
@@ -1314,6 +1711,15 @@ for (const mood of MOODS) {
         'click',
         () => {
 
+            // Los FBX no traen expresiones faciales
+            if (!currentVrm?.expressionManager) {
+                messagePanel.textContent =
+                    'Este modelo no tiene expresiones faciales.';
+                setMoodPanelVisible(false);
+                textInput.focus();
+                return;
+            }
+
             applyMood(
                 mood.id === 'neutral' ? null : mood.id
             );
@@ -1326,7 +1732,7 @@ for (const mood of MOODS) {
 
     moodButtons[mood.id] = button;
 
-    moodPanel.appendChild(
+    moodGrid.appendChild(
         button
     );
 }
@@ -1336,6 +1742,7 @@ interfaceContainer.appendChild(
 );
 
 refreshMoodButtons();
+setPlusTab('mood');
 
 // ======================================================
 // STATUS
@@ -1420,6 +1827,10 @@ const chatHistory: ChatMessage[] = [];
 let chatAbort: AbortController | null = null;
 
 function stopTalking() {
+
+    // Interrumpido por el usuario: no hay vuelta a
+    // neutral pendiente, la cara se queda como esté.
+    cancelNeutralFaceTimer();
 
     if (chatAbort) {
         chatAbort.abort();
@@ -1581,6 +1992,7 @@ function speakBrowserVoice(text: string) {
 
         if (currentStatus === 'speaking') {
             setStatus('waiting');
+            scheduleNeutralFace();
         }
     };
 
@@ -1610,6 +2022,7 @@ async function speak(text: string) {
 
         if (currentStatus === 'speaking') {
             setStatus('waiting');
+            scheduleNeutralFace();
         }
 
         return;
@@ -1682,12 +2095,36 @@ async function sendQuestion() {
         refreshMoodButtons();
     }
 
+    // 3) Bailes DESACTIVADO temporalmente (no quedaba
+    // natural). Para reactivar: descomentar el bloque de
+    // abajo y la pestaña "Bailes" (tabDanceButton).
+    /*
+    const danceCmd = extractDanceCommand(
+        found.cleaned,
+        getCachedEffects()
+    );
+
+    if (danceCmd.effect) {
+        void runDance(danceCmd.effect);
+    }
+
+    const textoLimpio = danceCmd.effect
+        ? danceCmd.cleaned
+        : found.cleaned;
+    */
+    const textoLimpio = found.cleaned;
+
     // Orden pura ("pon cara triste") o solo emoticonos:
     // reacciona con cara + voz breve propia, sin gastar IA.
-    if (!found.cleaned) {
+    // (Antes también cubría órdenes de baile: desactivado.)
+    if (!textoLimpio) {
 
         const mood = found.mood || cmd.mood;
-        const ack = (cmd.mood && MOOD_ACK[cmd.mood]) || null;
+        // NOTA bailes desactivados: aquí iba el acuse
+        // "¡Marchando! Bailo ..." y el apunte al historial
+        // "Baila: ..." (ver bloque 3 de más arriba).
+        const ack = (cmd.mood && MOOD_ACK[cmd.mood])
+            || null;
 
         pushDisplay('user', pregunta);
 
@@ -1721,7 +2158,7 @@ async function sendQuestion() {
         return;
     }
 
-    const textoParaIa = found.cleaned;
+    const textoParaIa = textoLimpio;
 
     setStatus(
         'thinking'
@@ -1745,8 +2182,15 @@ async function sendQuestion() {
 
         console.log(
             `Respuesta (${res.proveedor}/${res.modelo}):`,
-            res.respuesta
+            res.respuesta,
+            res.usage ? `(tokens ${res.usage.input}+${res.usage.output}, ${formatCost(res.costEstimateUSD)})` : ''
         );
+
+        if (res.usage && (res.usage.input + res.usage.output) > 0) {
+            pushSystemEntry(
+                `⚡ ${res.modelo} · ${res.usage.input}+${res.usage.output} tokens · ${formatCost(res.costEstimateUSD)} estimado`
+            );
+        }
 
         // Si la IA responde con emoticonos, también ponen la cara
         // y se quitan antes de hablar para no leerlos.
@@ -1811,7 +2255,10 @@ plusButton.addEventListener(
 
         setMoodPanelVisible(visible);
 
-        if (!visible) {
+        if (visible) {
+            // (Bailes desactivados: aquí se releía la carpeta
+            // de efects con refreshDanceList().)
+        } else {
             textInput.focus();
         }
     }
@@ -2328,35 +2775,100 @@ function newFingerGoals() {
  * Derecho   = -85 grados
  */
 
-const leftArmRestAngle =
+let leftArmRestAngle =
     THREE.MathUtils.degToRad(85);
 
-const rightArmRestAngle =
+let rightArmRestAngle =
     THREE.MathUtils.degToRad(-85);
 
-const leftElbowRestAngle =
+let leftElbowRestAngle =
     THREE.MathUtils.degToRad(3);
 
-const rightElbowRestAngle =
+let rightElbowRestAngle =
     THREE.MathUtils.degToRad(-3);
+
+// El rig Mixamo ya cuelga los brazos: con FBX el reposo
+// es 0; con VRM se mantienen los valores de arriba.
+function setRestAnglesForKind(kind: 'vrm' | 'fbx') {
+
+    if (kind === 'fbx') {
+        leftArmRestAngle = THREE.MathUtils.degToRad(-70);
+        rightArmRestAngle = THREE.MathUtils.degToRad(70);
+        leftElbowRestAngle = 0;
+        rightElbowRestAngle = 0;
+    } else {
+        leftArmRestAngle = THREE.MathUtils.degToRad(85);
+        rightArmRestAngle = THREE.MathUtils.degToRad(-85);
+        leftElbowRestAngle = THREE.MathUtils.degToRad(3);
+        rightElbowRestAngle = THREE.MathUtils.degToRad(-3);
+    }
+}
 
 // ======================================================
 // LOAD AVATAR (con cambio en caliente)
 // ======================================================
 
-// Para añadir un avatar nuevo basta con copiar el .vrm a
-// public/models: al arrancar (y al abrir el desplegable)
-// se pide GET /api/avatars al backend, que escanea la
-// carpeta y devuelve todos los .vrm encontrados.
+// Para añadir un avatar nuevo basta con copiar el .vrm o
+// .fbx a public/models: al arrancar (y al abrir el
+// desplegable) se pide GET /api/avatars al backend, que
+// escanea la carpeta y devuelve los encontrados.
 interface AvatarEntry {
     file: string;
     label: string;
+    kind: 'vrm' | 'fbx';
+}
+
+function kindOfAvatarFile(file: string): 'vrm' | 'fbx' {
+    return isFbxFile(file) ? 'fbx' : 'vrm';
 }
 
 const FALLBACK_AVATARS: AvatarEntry[] = [
-    { file: 'AvatarSample_A.vrm', label: 'Avatar A' },
-    { file: 'AvatarSample_C.vrm', label: 'Avatar C' }
+    { file: 'AvatarSample_A.vrm', label: 'Avatar A', kind: 'vrm' },
+    { file: 'AvatarSample_C.vrm', label: 'Avatar C', kind: 'vrm' },
+    { file: 'Arissa.fbx', label: 'Arissa (FBX)', kind: 'fbx' }
 ];
+
+// Avatar por defecto al arrancar (si está en la lista).
+const DEFAULT_AVATAR_FILE = 'AvatarSample_A.vrm';
+
+// Idle en bucle por avatar (ficheros de public/anims).
+// Vacío a propósito: los avatares usan el idle procedural
+// como los VRM. Para asignar uno, p. ej.:
+// { 'Arissa.fbx': 'Breathing Idle.fbx' }
+const AVATAR_IDLE_CLIPS: Record<string, string> = {};
+
+// Idle por defecto para cualquier FBX que no tenga uno asignado arriba
+// (public/anims/Breathing Idle.fbx). Si el fichero no existe, se usa el
+// idle procedural.
+const DEFAULT_FBX_IDLE = 'Breathing Idle.fbx';
+
+async function fetchAvailableAnims(): Promise<string[]> {
+
+    try {
+
+        const res = await fetch(
+            `${getApiBase()}/api/anims`
+        );
+
+        if (res.ok) {
+
+            const data = await res.json();
+            const list = Array.isArray(data) ? data : data.anims;
+
+            if (Array.isArray(list)) {
+
+                return list
+                    .map((a: any) => a?.file)
+                    .filter((f: any) => typeof f === 'string');
+            }
+        }
+
+    } catch {
+        // Backend apagado: sin validación de anims.
+    }
+
+    return [];
+}
 
 let AVATARS: AvatarEntry[] = [...FALLBACK_AVATARS];
 
@@ -2386,13 +2898,14 @@ async function fetchAvailableAvatars(): Promise<AvatarEntry[] | null> {
                     .filter((a: any) =>
                         a &&
                         typeof a.file === 'string' &&
-                        /\.vrm$/i.test(a.file)
+                        /\.(vrm|fbx)$/i.test(a.file)
                     )
                     .map((a: any) => ({
                         file: a.file,
                         label: typeof a.label === 'string' && a.label.trim()
                             ? a.label
-                            : a.file.replace(/\.vrm$/i, '')
+                            : a.file.replace(/\.(vrm|fbx)$/i, ''),
+                        kind: kindOfAvatarFile(a.file)
                     }));
 
                 if (cleaned.length) {
@@ -2422,13 +2935,14 @@ async function fetchAvailableAvatars(): Promise<AvatarEntry[] | null> {
                     .filter((a: any) =>
                         a &&
                         typeof a.file === 'string' &&
-                        /\.vrm$/i.test(a.file)
+                        /\.(vrm|fbx)$/i.test(a.file)
                     )
                     .map((a: any) => ({
                         file: a.file,
                         label: typeof a.label === 'string' && a.label.trim()
                             ? a.label
-                            : a.file.replace(/\.vrm$/i, '')
+                            : a.file.replace(/\.(vrm|fbx)$/i, ''),
+                        kind: kindOfAvatarFile(a.file)
                     }));
 
                 if (cleaned.length) {
@@ -2462,7 +2976,46 @@ async function refreshAvatarList(): Promise<boolean> {
 let currentAvatarFile = AVATARS[0].file;
 let avatarLoadToken = 0;
 
+// Detecta hacia dónde mira el modelo (VRM0, VRM1 y Mixamo difieren)
+// midiendo la posición de los hombros, y lo gira para que mire a cámara.
+function orientAvatar(rig: any) {
+
+    let fzDetected: -1 | 1 = rig.meta?.metaVersion === '0' ? -1 : 1;
+
+    try {
+        rig.scene.rotation.y = 0;
+        rig.scene.updateMatrixWorld(true);
+
+        const l = rig.humanoid.getNormalizedBoneNode('leftUpperArm');
+        const r = rig.humanoid.getNormalizedBoneNode('rightUpperArm');
+
+        if (l && r) {
+            const pl = new THREE.Vector3();
+            const pr = new THREE.Vector3();
+            l.getWorldPosition(pl);
+            r.getWorldPosition(pr);
+
+            // adelante = arriba x (derecha - izquierda)
+            const forward = new THREE.Vector3(0, 1, 0).cross(pr.sub(pl));
+
+            if (Math.abs(forward.z) > 1e-4) {
+                fzDetected = forward.z < 0 ? -1 : 1;
+            }
+        }
+    } catch (error) {
+        console.warn('No se pudo detectar la orientación del avatar:', error);
+    }
+
+    avatarFz = fzDetected;
+    avatarBaseYaw = fzDetected === -1 ? Math.PI : 0;
+    rig.scene.rotation.y = avatarBaseYaw;
+}
+
 function disposeAvatar() {
+
+    // Corta el baile y el idle en curso (su escena se elimina).
+    cancelDance();
+    stopIdleLoop(true);
 
     if (!currentVrm) {
         return;
@@ -2532,6 +3085,50 @@ function loadAvatar(file: string) {
 
     setStatus('waiting');
 
+    setRestAnglesForKind(isFbxFile(file) ? 'fbx' : 'vrm');
+
+    // Rama FBX (Mixamo): fachada compatible con el código
+    // VRM (la pose de reposo del FBX ya es válida).
+    if (isFbxFile(file)) {
+
+        loadFbxRig(file).then(
+            (rig) => {
+
+                if (token !== avatarLoadToken) {
+                    return;
+                }
+
+                currentVrm =
+                    rig as any;
+
+                orientAvatar(rig);
+
+                scene.add(
+                    rig.scene
+                );
+
+                setupAvatarRigged(false, token);
+            },
+
+            (error) => {
+
+                if (token !== avatarLoadToken) {
+                    return;
+                }
+
+                console.error(
+                    'Error cargando avatar:',
+                    error
+                );
+
+                messagePanel.textContent =
+                    `No se pudo cargar ${file}.`;
+            }
+        );
+
+        return;
+    }
+
     loader.load(
         `/models/${file}`,
 
@@ -2557,8 +3154,7 @@ function loadAvatar(file: string) {
             vrm.scene
         );
 
-        vrm.scene.rotation.y =
-            Math.PI;
+        orientAvatar(vrm);
 
         vrm.scene.position.set(
             0,
@@ -2576,123 +3172,163 @@ function loadAvatar(file: string) {
             vrm.scene
         );
 
-        // ------------------------------------------
-        // BONES
-        // ------------------------------------------
+        setupAvatarRigged(true, token);
+    },
 
-        headBone =
-            vrm.humanoid.getNormalizedBoneNode(
-                'head'
-            );
+    undefined,
 
-        spineBone =
-            vrm.humanoid.getNormalizedBoneNode(
-                'spine'
-            );
+    (error) => {
 
-        leftUpperArm =
-            vrm.humanoid.getNormalizedBoneNode(
-                'leftUpperArm'
-            );
-
-        rightUpperArm =
-            vrm.humanoid.getNormalizedBoneNode(
-                'rightUpperArm'
-            );
-
-        leftLowerArm =
-            vrm.humanoid.getNormalizedBoneNode(
-                'leftLowerArm'
-            );
-
-        rightLowerArm =
-            vrm.humanoid.getNormalizedBoneNode(
-                'rightLowerArm'
-            );
-
-        leftHand =
-            vrm.humanoid.getNormalizedBoneNode(
-                'leftHand'
-            );
-
-        rightHand =
-            vrm.humanoid.getNormalizedBoneNode(
-                'rightHand'
-            );
-
-        jawBone =
-            vrm.humanoid.getNormalizedBoneNode(
-                'jaw'
-            );
-
-        // ------------------------------------------
-        // FINGERS
-        // ------------------------------------------
-
-        const fingerNames = [
-
-            'thumbProximal',
-            'thumbIntermediate',
-            'thumbDistal',
-
-            'indexProximal',
-            'indexIntermediate',
-            'indexDistal',
-
-            'middleProximal',
-            'middleIntermediate',
-            'middleDistal',
-
-            'ringProximal',
-            'ringIntermediate',
-            'ringDistal',
-
-            'littleProximal',
-            'littleIntermediate',
-            'littleDistal'
-
-        ];
-
-        for (
-            const fingerName of fingerNames
-        ) {
-
-            const leftFinger =
-                vrm.humanoid.getNormalizedBoneNode(
-                    `left${capitalize(fingerName)}`
-                );
-
-            const rightFinger =
-                vrm.humanoid.getNormalizedBoneNode(
-                    `right${capitalize(fingerName)}`
-                );
-
-            if (leftFinger) {
-                leftFingerBones.push(
-                    leftFinger
-                );
-            }
-
-            if (rightFinger) {
-                rightFingerBones.push(
-                    rightFinger
-                );
-            }
+        if (token !== avatarLoadToken) {
+            return;
         }
 
-        console.log(
-            'Dedos izquierdos:',
-            leftFingerBones.length
+        console.error(
+            'Error cargando avatar:',
+            error
         );
 
-        console.log(
-            'Dedos derechos:',
-            rightFingerBones.length
+        messagePanel.textContent =
+            `No se pudo cargar ${file}.`;
+    }
+    );
+}
+
+// ------------------------------------------------------
+// Puesta en marcha común tras cargar el modelo (VRM o
+// fachada FBX): cablea huesos/dedos, aplica reposo de
+// brazos (solo VRM: el Mixamo ya cuelga), expresión,
+// enfoque inicial e idle por defecto. Usa currentVrm,
+// ya asignado por loadAvatar.
+// ------------------------------------------------------
+
+function setupAvatarRigged(applyRestPose: boolean, token: number) {
+
+    const vrm: any = currentVrm;
+
+    if (!vrm) {
+        return;
+    }
+
+    // ------------------------------------------
+    // BONES
+    // ------------------------------------------
+
+    headBone =
+        vrm.humanoid.getNormalizedBoneNode(
+            'head'
         );
 
-        // ------------------------------------------
-        // ARM REST POSE
-        // ------------------------------------------
+    spineBone =
+        vrm.humanoid.getNormalizedBoneNode(
+            'spine'
+        );
+
+    leftUpperArm =
+        vrm.humanoid.getNormalizedBoneNode(
+            'leftUpperArm'
+        );
+
+    rightUpperArm =
+        vrm.humanoid.getNormalizedBoneNode(
+            'rightUpperArm'
+        );
+
+    leftLowerArm =
+        vrm.humanoid.getNormalizedBoneNode(
+            'leftLowerArm'
+        );
+
+    rightLowerArm =
+        vrm.humanoid.getNormalizedBoneNode(
+            'rightLowerArm'
+        );
+
+    leftHand =
+        vrm.humanoid.getNormalizedBoneNode(
+            'leftHand'
+        );
+
+    rightHand =
+        vrm.humanoid.getNormalizedBoneNode(
+            'rightHand'
+        );
+
+    jawBone =
+        vrm.humanoid.getNormalizedBoneNode(
+            'jaw'
+        );
+
+    // ------------------------------------------
+    // FINGERS
+    // ------------------------------------------
+
+    const fingerNames = [
+
+        'thumbProximal',
+        'thumbIntermediate',
+        'thumbDistal',
+
+        'indexProximal',
+        'indexIntermediate',
+        'indexDistal',
+
+        'middleProximal',
+        'middleIntermediate',
+        'middleDistal',
+
+        'ringProximal',
+        'ringIntermediate',
+        'ringDistal',
+
+        'littleProximal',
+        'littleIntermediate',
+        'littleDistal'
+
+    ];
+
+    for (
+        const fingerName of fingerNames
+    ) {
+
+        const leftFinger =
+            vrm.humanoid.getNormalizedBoneNode(
+                `left${capitalize(fingerName)}`
+            );
+
+        const rightFinger =
+            vrm.humanoid.getNormalizedBoneNode(
+                `right${capitalize(fingerName)}`
+            );
+
+        if (leftFinger) {
+            leftFingerBones.push(
+                leftFinger
+            );
+        }
+
+        if (rightFinger) {
+            rightFingerBones.push(
+                rightFinger
+            );
+        }
+    }
+
+    console.log(
+        'Dedos izquierdos:',
+        leftFingerBones.length
+    );
+
+    console.log(
+        'Dedos derechos:',
+        rightFingerBones.length
+    );
+
+    // ------------------------------------------
+    // ARM REST POSE (solo VRM)
+    // ------------------------------------------
+
+    if (applyRestPose) {
 
         if (leftUpperArm) {
 
@@ -2751,33 +3387,64 @@ function loadAvatar(file: string) {
         console.log(
             'Avatar cargado - pose de brazos aplicada'
         );
+    }
 
-        applyMood(activeMood);
+    applyMood(activeMood);
+    attachDanceVrm(vrm);
 
-        // Enfoque de cara activo por defecto al arrancar
-        if (!faceFocusAppliedOnStart) {
-            faceFocusAppliedOnStart = true;
-            focusFace();
-        }
-    },
+    // Enfoque de cara activo por defecto al arrancar
+    if (!faceFocusAppliedOnStart) {
+        faceFocusAppliedOnStart = true;
+        focusFace();
+    }
 
-    undefined,
+    void ensureAvatarIdle(token);
+}
 
-    (error) => {
+async function ensureAvatarIdle(token: number) {
 
-        if (token !== avatarLoadToken) {
+    const file = currentAvatarFile;
+    const idleFile =
+        AVATAR_IDLE_CLIPS[file] ??
+        (isFbxFile(file) ? DEFAULT_FBX_IDLE : undefined);
+
+    if (!idleFile || !currentVrm?.scene) {
+        stopIdleLoop(true);
+        return;
+    }
+
+    try {
+
+        const anims = await fetchAvailableAnims();
+
+        if (token !== avatarLoadToken || currentAvatarFile !== file) {
             return;
         }
 
-        console.error(
-            'Error cargando avatar:',
-            error
+        if (anims.length && !anims.includes(idleFile)) {
+            console.warn(
+                `[idle] "${idleFile}" no está en public/anims.`
+            );
+            stopIdleLoop(true);
+            return;
+        }
+
+        await startIdleLoop(
+            currentVrm,
+            idleFile,
+            idleFile.replace(/\.fbx$/i, '')
         );
 
-        messagePanel.textContent =
-            `No se pudo cargar ${file}.`;
+        if (token !== avatarLoadToken || currentAvatarFile !== file) {
+            stopIdleLoop(true);
+        }
+
+    } catch (err) {
+        console.error('[idle] No se pudo arrancar:', err);
+        if (token === avatarLoadToken) {
+            stopIdleLoop(true);
+        }
     }
-    );
 }
 
 // ======================================================
@@ -2928,7 +3595,7 @@ avatarButton.addEventListener(
 
         setAvatarPanelVisible(opening);
 
-        // Al abrir, re-escanea por si se añadió un .vrm nuevo.
+        // Al abrir, re-escanea por si se añadió un avatar nuevo.
         if (opening) {
             refreshAvatarList();
         }
@@ -2983,7 +3650,9 @@ iaPanel.style.right = '26px';
 iaPanel.style.display = 'none';
 iaPanel.style.flexDirection = 'column';
 iaPanel.style.gap = '8px';
-iaPanel.style.width = '250px';
+iaPanel.style.width = '305px';
+iaPanel.style.maxHeight = 'calc(100vh - 140px)';
+iaPanel.style.overflowY = 'auto';
 iaPanel.style.padding = '12px';
 iaPanel.style.borderRadius = '14px';
 iaPanel.style.background = 'rgba(0,0,0,0.55)';
@@ -2993,37 +3662,81 @@ iaPanel.style.fontSize = '13px';
 iaPanel.style.pointerEvents = 'auto';
 iaPanel.style.zIndex = '20';
 
+const IA_FIELD_STYLE = 'padding:7px; border-radius:8px; border:1px solid rgba(255,255,255,0.25); background:rgba(255,255,255,0.1); color:inherit;';
+
 iaPanel.innerHTML = `
     <div style="font-weight:bold; font-size:13px;">IA y voz</div>
     <label style="display:flex; flex-direction:column; gap:4px;">
-        Proveedor
-        <select id="ia-provider" style="padding:7px; border-radius:8px; border:1px solid rgba(255,255,255,0.25); background:rgba(255,255,255,0.1); color:inherit;">
+        API activa
+        <select id="ia-provider" style="${IA_FIELD_STYLE}">
             <option value="ollama">Ollama (local, gratis)</option>
-            <option value="openai">Cloud (OpenAI compatible)</option>
         </select>
     </label>
-    <label style="display:flex; flex-direction:column; gap:4px;">
-        Modelo
-        <select id="ia-model" style="padding:7px; border-radius:8px; border:1px solid rgba(255,255,255,0.25); background:rgba(255,255,255,0.1); color:inherit;">
-        </select>
-    </label>
+    <div id="ia-cloud-box" style="display:flex; flex-direction:column; gap:8px;">
+        <label style="display:flex; flex-direction:column; gap:4px;">
+            Nombre
+            <input id="ia-name" placeholder="Ej: Mi Groq barato" style="${IA_FIELD_STYLE}" />
+        </label>
+        <label style="display:flex; flex-direction:column; gap:4px;">
+            Tipo
+            <select id="ia-type" style="${IA_FIELD_STYLE}">
+                <option value="openai-compat">OpenAI compatible (OpenAI, Gemini, Groq…)</option>
+                <option value="anthropic">Anthropic nativo (Claude)</option>
+            </select>
+        </label>
+        <label style="display:flex; flex-direction:column; gap:4px;">
+            Base URL
+            <input id="ia-baseurl" placeholder="https://…" style="${IA_FIELD_STYLE}" />
+        </label>
+        <label style="display:flex; flex-direction:column; gap:4px;">
+            API key (solo memoria, no se guarda)
+            <span style="display:flex; gap:6px;">
+                <input id="ia-key" type="password" autocomplete="off" placeholder="sk-… / AIza… / sk-ant-… / xai-…" style="flex:1; min-width:0; ${IA_FIELD_STYLE}" />
+                <button id="ia-key-eye" type="button" title="Mostrar / ocultar" style="padding:7px 10px; border-radius:8px; border:1px solid rgba(255,255,255,0.25); background:transparent; color:inherit; cursor:pointer;">👁</button>
+            </span>
+        </label>
+        <label style="display:flex; flex-direction:column; gap:4px;">
+            Modelo <span style="opacity:0.7;">(baratos primero: gpt-oss-20b, gemini-2.0-flash, gpt-4o-mini)</span>
+            <span style="display:flex; gap:6px;">
+                <select id="ia-model" style="flex:1; min-width:0; ${IA_FIELD_STYLE}"></select>
+                <button id="ia-reload" type="button" title="Recargar modelos de la API" style="padding:7px 10px; border-radius:8px; border:1px solid rgba(255,255,255,0.25); background:transparent; color:inherit; cursor:pointer;">↻</button>
+            </span>
+            <input id="ia-model-custom" placeholder="u otro modelo manual…" style="${IA_FIELD_STYLE}" />
+        </label>
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">
+            <button id="ia-test" type="button" title="1 llamada mínima para ver tokens y coste" style="flex:1; padding:8px; border:1px solid rgba(255,255,255,0.3); border-radius:10px; background:transparent; color:inherit; font-size:13px; cursor:pointer;">⚡ Probar gasto</button>
+        </div>
+        <div id="ia-cost" style="font-size:12px; opacity:0.9;"></div>
+        <div style="display:flex; gap:6px;">
+            <button id="ia-new" type="button" title="Crear una API nueva" style="flex:1; padding:7px; border:1px solid rgba(255,255,255,0.3); border-radius:10px; background:transparent; color:inherit; font-size:12px; cursor:pointer;">＋ Nueva</button>
+            <button id="ia-delete" type="button" title="Eliminar la API seleccionada" style="flex:1; padding:7px; border:1px solid rgba(239,68,68,0.6); border-radius:10px; background:rgba(239,68,68,0.15); color:inherit; font-size:12px; cursor:pointer;">🗑 Eliminar</button>
+        </div>
+        <div style="font-size:11px; opacity:0.75; line-height:1.5;">
+            La clave solo vive en la memoria del backend y se borra al reiniciar.
+            Costes reales en:
+            <a href="https://platform.openai.com/usage" target="_blank" rel="noopener" style="color:#93c5fd;">OpenAI</a> ·
+            <a href="https://aistudio.google.com/" target="_blank" rel="noopener" style="color:#93c5fd;">Gemini</a> ·
+            <a href="https://console.anthropic.com/" target="_blank" rel="noopener" style="color:#93c5fd;">Anthropic</a> ·
+            <a href="https://console.groq.com/" target="_blank" rel="noopener" style="color:#93c5fd;">Groq</a>
+        </div>
+    </div>
     <label style="display:flex; flex-direction:column; gap:4px;">
         Backend
-        <input id="ia-backend" style="padding:7px; border-radius:8px; border:1px solid rgba(255,255,255,0.25); background:rgba(255,255,255,0.1); color:inherit;" />
+        <input id="ia-backend" style="${IA_FIELD_STYLE}" />
     </label>
     <label style="display:flex; flex-direction:column; gap:4px;">
         Voz
-        <select id="ia-voice" style="padding:7px; border-radius:8px; border:1px solid rgba(255,255,255,0.25); background:rgba(255,255,255,0.1); color:inherit;">
+        <select id="ia-voice" style="${IA_FIELD_STYLE}">
         </select>
     </label>
     <label style="display:flex; flex-direction:column; gap:4px;">
         Locutor
-        <select id="ia-speaker" style="padding:7px; border-radius:8px; border:1px solid rgba(255,255,255,0.25); background:rgba(255,255,255,0.1); color:inherit;">
+        <select id="ia-speaker" style="${IA_FIELD_STYLE}">
             <option value="0">Locutor 1</option>
         </select>
     </label>
     <button id="ia-save" type="button" style="padding:8px; border:none; border-radius:10px; background:#3b82f6; color:white; font-size:13px; cursor:pointer;">Guardar</button>
-    <div id="ia-status" style="font-size:12px; opacity:0.85;"></div>
+    <div id="ia-status" style="font-size:12px; opacity:0.85; white-space:pre-wrap;"></div>
 `;
 
 interfaceContainer.appendChild(
@@ -3082,14 +3795,43 @@ function refreshIaSpeakers(active: number) {
     );
 }
 
-// Modelos cloud habituales (el backend acepta cualquiera).
-const CLOUD_MODELS = [
-    'gpt-4o-mini',
-    'gpt-4o',
-    'gpt-4.1-mini',
-    'gpt-4.1',
-    'o4-mini'
-];
+// Sugeridos locales si el backend no responde (el backend
+// manda los suyos, con Groq barato primero).
+const FALLBACK_MODELS: Record<string, string[]> = {
+    openai: ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'gpt-4.1', 'o4-mini'],
+    gemini: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'],
+    anthropic: ['claude-3-5-haiku-latest', 'claude-sonnet-4-20250514'],
+    groq: ['openai/gpt-oss-20b', 'openai/gpt-oss-120b']
+};
+
+let iaProfiles: CloudProfile[] = [];
+let iaCreating = false;
+
+const iaCloudBox = iaPanel.querySelector('#ia-cloud-box') as HTMLDivElement;
+const iaNameInput = iaPanel.querySelector('#ia-name') as HTMLInputElement;
+const iaTypeSelect = iaPanel.querySelector('#ia-type') as HTMLSelectElement;
+const iaBaseUrlInput = iaPanel.querySelector('#ia-baseurl') as HTMLInputElement;
+const iaKeyInput = iaPanel.querySelector('#ia-key') as HTMLInputElement;
+const iaKeyEye = iaPanel.querySelector('#ia-key-eye') as HTMLButtonElement;
+const iaModelCustom = iaPanel.querySelector('#ia-model-custom') as HTMLInputElement;
+const iaReloadButton = iaPanel.querySelector('#ia-reload') as HTMLButtonElement;
+const iaTestButton = iaPanel.querySelector('#ia-test') as HTMLButtonElement;
+const iaNewButton = iaPanel.querySelector('#ia-new') as HTMLButtonElement;
+const iaDeleteButton = iaPanel.querySelector('#ia-delete') as HTMLButtonElement;
+const iaCost = iaPanel.querySelector('#ia-cost') as HTMLDivElement;
+
+iaKeyEye.addEventListener('click', () => {
+    iaKeyInput.type = iaKeyInput.type === 'password' ? 'text' : 'password';
+    textInput.focus();
+});
+
+function selectedProfile(): CloudProfile | null {
+    const id = iaProviderSelect.value;
+    if (!id || id === 'ollama') {
+        return null;
+    }
+    return iaProfiles.find((p) => p.id === id) || null;
+}
 
 function fillIaModels(models: string[], current: string) {
 
@@ -3113,24 +3855,84 @@ function fillIaModels(models: string[], current: string) {
     iaModelSelect.value = current;
 }
 
-async function refreshIaModels(provider: string, current: string) {
+function fillProviderOptions(active: string) {
 
-    if (provider === 'openai') {
-        fillIaModels(CLOUD_MODELS, current);
+    iaProviderSelect.innerHTML = '';
+
+    const ollamaOpt = document.createElement('option');
+    ollamaOpt.value = 'ollama';
+    ollamaOpt.textContent = 'Ollama (local, gratis)';
+    iaProviderSelect.appendChild(ollamaOpt);
+
+    for (const p of iaProfiles) {
+        const option = document.createElement('option');
+        option.value = p.id;
+        option.textContent = `${p.custom ? '🔧' : '☁️'} ${p.label}${p.keyPresent ? '' : ' (sin clave)'}`;
+        iaProviderSelect.appendChild(option);
+    }
+
+    if ([...iaProviderSelect.options].some((o) => o.value === active)) {
+        iaProviderSelect.value = active;
+    } else {
+        iaProviderSelect.value = 'ollama';
+    }
+}
+
+function showCloudFields() {
+    const cloud = iaProviderSelect.value !== 'ollama';
+    iaCloudBox.style.display = cloud ? 'flex' : 'none';
+    if (!cloud) {
+        iaCost.textContent = '';
+    }
+}
+
+function fillCloudForm(p: CloudProfile | null) {
+    if (!p) {
+        return;
+    }
+    iaNameInput.value = p.label;
+    iaTypeSelect.value = p.type === 'anthropic' ? 'anthropic' : 'openai-compat';
+    iaBaseUrlInput.value = p.baseUrl;
+    // La clave nunca viene del backend: no se rellena.
+    // Si se deja vacía al guardar, se conserva la anterior.
+    iaKeyInput.value = '';
+    iaKeyInput.placeholder = p.keyPresent
+        ? `Clave guardada (****${p.keyLast4}) — vacío = conservar`
+        : 'sk-… / AIza… / sk-ant-… / xai-…';
+    const curated = p.curatedModels?.length ? p.curatedModels : (FALLBACK_MODELS[p.id] || FALLBACK_MODELS.openai);
+    fillIaModels(curated, p.model);
+    iaModelCustom.value = '';
+    iaDeleteButton.style.display = p.custom ? 'block' : 'none';
+}
+
+async function refreshIaModels(current: string) {
+
+    const id = iaProviderSelect.value;
+
+    if (id === 'ollama') {
+        try {
+            const models = await listOllamaModels();
+            fillIaModels(models.length ? models : [current], current);
+        } catch {
+            fillIaModels([current], current);
+        }
         return;
     }
 
+    const p = selectedProfile();
+    const curated = p?.curatedModels?.length ? p.curatedModels : (FALLBACK_MODELS[id] || FALLBACK_MODELS.openai);
+    fillIaModels(curated, p?.model || current);
+
     try {
-
-        const models = await listOllamaModels();
-
-        fillIaModels(
-            models.length ? models : [current],
-            current
-        );
-
+        const live = await listCloudModels(id);
+        if (live.models?.length) {
+            fillIaModels(live.models, p?.model || current);
+        }
+        if (live.note) {
+            iaStatus.textContent = live.note;
+        }
     } catch {
-        fillIaModels([current], current);
+        // Sin conexión: se queda con los sugeridos.
     }
 }
 
@@ -3142,15 +3944,24 @@ async function refreshIaPanel() {
 
         const cfg = await getConfig();
 
-        iaProviderSelect.value = cfg.provider;
+        iaProfiles = cfg.profiles || [];
+        fillProviderOptions(cfg.provider);
+        showCloudFields();
+
+        const active = selectedProfile();
+        fillCloudForm(active);
+
+        const keyMissing = cfg.provider !== 'ollama' && !(cfg.activeProfile?.keyPresent ?? cfg.openaiKeyPresent);
 
         iaStatus.textContent =
             `Activo: ${cfg.provider} / ${cfg.model} / ${cfg.ttsVoice} locutor ${cfg.ttsSpeaker + 1}` +
-            (cfg.provider === 'openai' && !cfg.openaiKeyPresent
-                ? ' (sin clave en el backend)'
-                : '');
+            (keyMissing ? ' (sin clave: añade la API key arriba)' : '');
 
-        await refreshIaModels(cfg.provider, cfg.model);
+        if (cfg.provider !== 'ollama') {
+            await refreshIaModels(cfg.model);
+        } else {
+            await refreshIaModels(cfg.model);
+        }
         await refreshIaVoices(cfg.ttsVoice, cfg.ttsSpeaker);
 
     } catch {
@@ -3163,16 +3974,41 @@ async function refreshIaPanel() {
 iaProviderSelect.addEventListener(
     'change',
     async () => {
+        iaCreating = false;
+        iaNewButton.textContent = '＋ Nueva';
+        showCloudFields();
+        const p = selectedProfile();
+        fillCloudForm(p);
+        iaCost.textContent = '';
 
-        const current = iaModelSelect.value || '';
+        if (!p) {
+            try {
+                const cfg = await getConfig();
+                await refreshIaModels(cfg.ollamaModel || cfg.model);
+            } catch {
+                // Ignorar.
+            }
+            return;
+        }
 
         iaStatus.textContent = 'Cargando modelos...';
-
-        await refreshIaModels(iaProviderSelect.value, current);
-
-        iaStatus.textContent = '';
+        await refreshIaModels(p.model);
+        iaStatus.textContent = p.keyPresent
+            ? ''
+            : 'Sin clave en el backend: pega la API key y pulsa Guardar.';
     }
 );
+
+iaReloadButton.addEventListener('click', async () => {
+    const p = selectedProfile();
+    if (!p) {
+        return;
+    }
+    iaStatus.textContent = 'Recargando modelos de la API…';
+    await refreshIaModels(p.model);
+    iaStatus.textContent = '';
+    textInput.focus();
+});
 
 async function refreshIaVoices(active: string, speaker: number) {
 
@@ -3221,6 +4057,76 @@ iaVoiceSelect.addEventListener(
     }
 );
 
+iaTestButton.addEventListener('click', async () => {
+    const id = iaProviderSelect.value;
+    if (id === 'ollama') {
+        return;
+    }
+    iaCost.textContent = 'Probando con 1 llamada mínima…';
+    try {
+        const out = await testCloud(id);
+        if (!out.ok) {
+            iaCost.textContent = `❌ ${out.error || 'Falló la prueba.'}`;
+            return;
+        }
+        const u = out.usage || { input: 0, output: 0, total: 0 };
+        iaCost.textContent =
+            `✅ ${out.model} · ${out.ms}ms · ${u.input}+${u.output} tokens · ${formatCost(out.costEstimateUSD)}${out.priceKnown === false ? ' (precio n/d, mira el dashboard)' : ''}`;
+    } catch (err) {
+        iaCost.textContent = `❌ ${err instanceof Error ? err.message : 'Error al probar.'}`;
+    }
+    textInput.focus();
+});
+
+iaNewButton.addEventListener('click', () => {
+    iaCreating = !iaCreating;
+    if (iaCreating) {
+        iaProviderSelect.value = 'ollama';
+        showCloudFields();
+        iaCloudBox.style.display = 'flex';
+        iaNameInput.value = '';
+        iaTypeSelect.value = 'openai-compat';
+        iaBaseUrlInput.value = 'https://api.openai.com/v1';
+        iaKeyInput.value = '';
+        iaKeyInput.placeholder = 'Pega aquí la API key…';
+        fillIaModels(FALLBACK_MODELS.openai, 'gpt-4o-mini');
+        iaModelCustom.value = '';
+        iaDeleteButton.style.display = 'none';
+        iaNewButton.textContent = '✕ Cancelar';
+        iaStatus.textContent = 'Rellena nombre, base URL, modelo y clave, y pulsa Guardar.';
+        iaNameInput.focus();
+    } else {
+        iaNewButton.textContent = '＋ Nueva';
+        void refreshIaPanel();
+    }
+});
+
+iaDeleteButton.addEventListener('click', async () => {
+    const p = selectedProfile();
+    if (!p) {
+        return;
+    }
+    if (!p.custom) {
+        iaStatus.textContent = 'Las APIs integradas no se eliminan (puedes dejarlas sin clave).';
+        return;
+    }
+    if (!confirm(`¿Eliminar la API "${p.label}"? Su clave en memoria también se borra.`)) {
+        return;
+    }
+    iaStatus.textContent = 'Eliminando…';
+    try {
+        const cfg = await deleteCloudProfile(p.id);
+        iaProfiles = cfg.profiles || [];
+        fillProviderOptions(cfg.provider);
+        showCloudFields();
+        fillCloudForm(selectedProfile());
+        iaStatus.textContent = `Eliminada. Activo: ${cfg.provider} / ${cfg.model}.`;
+    } catch (err) {
+        iaStatus.textContent = err instanceof Error ? err.message : 'Error al eliminar.';
+    }
+    textInput.focus();
+});
+
 iaSaveButton.addEventListener(
     'click',
     async () => {
@@ -3233,15 +4139,80 @@ iaSaveButton.addEventListener(
                 iaBackendInput.value.trim() || 'http://localhost:3001'
             );
 
-            const cfg = await setConfig({
-                provider: iaProviderSelect.value,
-                model: iaModelSelect.value.trim(),
+            const model = (iaModelCustom.value.trim() || iaModelSelect.value || '').trim();
+            const voicePatch = {
                 voice: iaVoiceSelect.value || undefined,
                 speaker: Number(iaSpeakerSelect.value) || 0
-            });
+            };
 
+            // --- Crear API nueva ---
+            if (iaCreating) {
+                const label = iaNameInput.value.trim();
+                const baseUrl = iaBaseUrlInput.value.trim();
+                const apiKey = iaKeyInput.value;
+                if (!label || !baseUrl || !model) {
+                    iaStatus.textContent = 'Para crear: nombre, base URL y modelo son obligatorios.';
+                    return;
+                }
+                const created = await createCloudProfile({
+                    label,
+                    type: iaTypeSelect.value,
+                    baseUrl,
+                    model,
+                    apiKey
+                });
+                await setActiveProfile(created.id);
+                await setConfig(voicePatch);
+                iaCreating = false;
+                iaNewButton.textContent = '＋ Nueva';
+                const cfg = await getConfig();
+                iaProfiles = cfg.profiles || [];
+                fillProviderOptions(cfg.provider);
+                showCloudFields();
+                fillCloudForm(selectedProfile());
+                iaStatus.textContent = `Creada y activa: ${created.label} / ${model}.`;
+                return;
+            }
+
+            // --- Ollama ---
+            if (iaProviderSelect.value === 'ollama') {
+                const cfg = await setConfig({
+                    provider: 'ollama',
+                    model: model || undefined,
+                    ...voicePatch
+                });
+                iaStatus.textContent =
+                    `Activo: ${cfg.provider} / ${cfg.model} / ${cfg.ttsVoice} locutor ${cfg.ttsSpeaker + 1}`;
+                return;
+            }
+
+            // --- Modificar perfil cloud seleccionado ---
+            const p = selectedProfile();
+            if (!p) {
+                iaStatus.textContent = 'Selecciona una API válida.';
+                return;
+            }
+            const patch: { label?: string; type?: string; baseUrl?: string; model?: string; apiKey?: string } = {
+                label: iaNameInput.value.trim() || undefined,
+                type: iaTypeSelect.value,
+                baseUrl: iaBaseUrlInput.value.trim() || undefined,
+                model: model || undefined
+            };
+            // Vacío = conservar la clave anterior (nunca viaja de vuelta).
+            if (iaKeyInput.value) {
+                patch.apiKey = iaKeyInput.value;
+            }
+            await updateCloudProfile(p.id, patch);
+            await setActiveProfile(p.id);
+            const cfg = await setConfig(voicePatch);
+            iaProfiles = cfg.profiles || [];
+            fillProviderOptions(cfg.provider);
+            fillCloudForm(selectedProfile());
             iaStatus.textContent =
-                `Activo: ${cfg.provider} / ${cfg.model} / ${cfg.ttsVoice} locutor ${cfg.ttsSpeaker + 1}`;
+                `Activo: ${cfg.provider} / ${cfg.model}` +
+                ((cfg.activeProfile && !cfg.activeProfile.keyPresent)
+                    ? ' (sin clave: añade la API key y guarda de nuevo)'
+                    : '');
 
         } catch (err) {
 
@@ -4107,10 +5078,15 @@ document.addEventListener(
 );
 
 // Carga inicial (tras declarar toda la UI):
-// primero revisa si hay .vrm nuevos y luego carga.
+// primero revisa si hay avatares nuevos, elige el avatar
+// por defecto si está, y luego carga.
 refreshAvatarList()
     .catch(() => false)
     .finally(() => {
+        if (AVATARS.some((a) => a.file === DEFAULT_AVATAR_FILE)) {
+            currentAvatarFile = DEFAULT_AVATAR_FILE;
+        }
+        refreshAvatarButtons();
         loadAvatar(currentAvatarFile);
     });
 
@@ -4121,12 +5097,131 @@ refreshAvatarList()
 
 if ('serviceWorker' in navigator && import.meta.env.PROD) {
 
+    // Al cambiar de service worker se recarga una sola vez
+    // para que la página use el código nuevo.
+    let pwaReloading = false;
+
+    navigator.serviceWorker.addEventListener(
+        'controllerchange',
+        () => {
+
+            if (pwaReloading) {
+                return;
+            }
+
+            pwaReloading = true;
+            window.location.reload();
+        }
+    );
+
+    function showUpdateBanner(reg: ServiceWorkerRegistration) {
+
+        if (document.getElementById('paseta-update-banner')) {
+            return;
+        }
+
+        const banner = document.createElement('div');
+        banner.id = 'paseta-update-banner';
+        banner.style.position = 'fixed';
+        banner.style.left = '50%';
+        banner.style.bottom = '96px';
+        banner.style.transform = 'translateX(-50%)';
+        banner.style.zIndex = '60';
+        banner.style.display = 'flex';
+        banner.style.alignItems = 'center';
+        banner.style.gap = '10px';
+        banner.style.padding = '10px 14px';
+        banner.style.borderRadius = '14px';
+        banner.style.background = 'rgba(17,24,39,0.92)';
+        banner.style.color = 'white';
+        banner.style.fontSize = '14px';
+        banner.style.boxShadow = '0 4px 18px rgba(0,0,0,0.35)';
+        banner.style.pointerEvents = 'auto';
+
+        const label = document.createElement('span');
+        label.textContent = 'Nueva versión disponible';
+        banner.appendChild(label);
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = 'Actualizar';
+        button.style.padding = '8px 14px';
+        button.style.border = 'none';
+        button.style.borderRadius = '10px';
+        button.style.background = '#3b82f6';
+        button.style.color = 'white';
+        button.style.fontSize = '14px';
+        button.style.cursor = 'pointer';
+
+        button.addEventListener('click', () => {
+            button.textContent = 'Actualizando…';
+            button.style.opacity = '0.7';
+
+            if (reg.waiting) {
+                reg.waiting.postMessage('SKIP_WAITING');
+            }
+        });
+
+        banner.appendChild(button);
+        document.body.appendChild(banner);
+    }
+
+    function watchInstaller(reg: ServiceWorkerRegistration) {
+
+        const installer = reg.installing;
+
+        if (!installer) {
+            return;
+        }
+
+        installer.addEventListener('statechange', () => {
+
+            // Versión nueva lista mientras la página sigue
+            // con la vieja: se avisa en vez de recargar solo.
+            if (
+                installer.state === 'installed' &&
+                navigator.serviceWorker.controller
+            ) {
+                showUpdateBanner(reg);
+            }
+        });
+    }
+
     window.addEventListener(
         'load',
         () => {
 
             navigator.serviceWorker
                 .register('/sw.js')
+                .then((reg) => {
+
+                    // Actualización que quedó esperando con la
+                    // app cerrada: avisar nada más abrir.
+                    if (
+                        reg.waiting &&
+                        navigator.serviceWorker.controller
+                    ) {
+                        showUpdateBanner(reg);
+                    }
+
+                    reg.addEventListener('updatefound', () => {
+                        watchInstaller(reg);
+                    });
+
+                    // Al volver del segundo plano (típico en
+                    // Android) se comprueba si hay versión nueva.
+                    document.addEventListener(
+                        'visibilitychange',
+                        () => {
+
+                            if (document.visibilityState === 'visible') {
+                                reg.update().catch(() => {
+                                    // Sin red: se sigue con la caché.
+                                });
+                            }
+                        }
+                    );
+                })
                 .catch((err) => {
                     console.error(
                         '[PWA] No se pudo registrar el service worker:',
@@ -4891,16 +5986,22 @@ function initHumanMotion() {
     for (const n of ['hips', 'chest', 'neck', 'leftUpperLeg', 'rightUpperLeg']) {
         hb[n] = currentVrm.humanoid.getNormalizedBoneNode(n);
     }
-    fz = FORCE_FORWARD_Z ?? (currentVrm.meta?.metaVersion === '0' ? -1 : 1);
+    fz = FORCE_FORWARD_Z ?? avatarFz;
     if (currentVrm.lookAt) {
         currentVrm.lookAt.target = gazeTarget;
     }
     hbReady = true;
 }
 
-function updateHumanMotion(delta: number) {
+function updateHumanMotion(delta: number, light = false) {
 
     if (!currentVrm) {
+        return;
+    }
+
+    // Esta capa asume los huesos normalizados de VRM. Los rigs Mixamo (FBX)
+    // tienen otros ejes y rotaciones de reposo: escribir en ellos tumba las piernas.
+    if (typeof currentVrm.update !== 'function') {
         return;
     }
 
@@ -5000,21 +6101,28 @@ function updateHumanMotion(delta: number) {
     thinkBlend = smoothValue(thinkBlend, currentStatus === 'thinking' ? 1 : 0, delta, 2);
 
     // ---------------- CAMBIO DE PESO ----------------
-    shiftTimer += delta;
+    // (pausado en modo ligero: con un idle en bucle las
+    // piernas las manda el clip, no el procedural)
+    let tilt = 0;
 
-    if (shiftTimer >= shiftHold) {
-        shiftTimer = 0;
-        shiftHold = randomRange(6, 12);
-        shiftGoal = (Math.random() < 0.5 ? -1 : 1) * randomRange(0.5, 1);
+    if (!light) {
+
+        shiftTimer += delta;
+
+        if (shiftTimer >= shiftHold) {
+            shiftTimer = 0;
+            shiftHold = randomRange(6, 12);
+            shiftGoal = (Math.random() < 0.5 ? -1 : 1) * randomRange(0.5, 1);
+        }
+
+        shift = smoothValue(shift, shiftGoal, delta, 0.7);
+        tilt = shift * D(2.2);
+
+        if (hb.hips) { hb.hips.rotation.z = tilt; }
+        // Las piernas contrarrotan para que los pies no se muevan
+        if (hb.leftUpperLeg) { hb.leftUpperLeg.rotation.z = -tilt; }
+        if (hb.rightUpperLeg) { hb.rightUpperLeg.rotation.z = -tilt; }
     }
-
-    shift = smoothValue(shift, shiftGoal, delta, 0.7);
-    const tilt = shift * D(2.2);
-
-    if (hb.hips) { hb.hips.rotation.z = tilt; }
-    // Las piernas contrarrotan para que los pies no se muevan
-    if (hb.leftUpperLeg) { hb.leftUpperLeg.rotation.z = -tilt; }
-    if (hb.rightUpperLeg) { hb.rightUpperLeg.rotation.z = -tilt; }
 
     // ---------------- GESTOS AL HABLAR ----------------
     if (currentStatus === 'speaking') {
@@ -5253,17 +6361,37 @@ function animate() {
 
     elapsedTime += delta;
 
+    // El baile FBX manda sobre los huesos: mientras está
+    // activo se pausa el idle procedural (que si no
+    // pelearía con el clip) y al terminar se retoma solo.
+    // Lo mismo con un idle en bucle (respiración): el clip
+    // mueve el cuerpo y el procedural queda en ligero.
+    const dancing = updateDance(delta) > 0;
+    const looping = updateIdleLoop(delta) > 0;
+    const proceduralBody = !dancing && !looping;
+
     if (currentVrm) {
 
-        updateIdleAnimation(
-            delta
-        );
+        if (proceduralBody) {
 
-        updateHumanMotion(
-            delta
-        );
+            updateIdleAnimation(
+                delta
+            );
 
-        constrainArms();
+            updateHumanMotion(
+                delta,
+                false
+            );
+
+            constrainArms();
+
+        } else if (looping) {
+
+            updateHumanMotion(
+                delta,
+                true
+            );
+        }
 
         updateBlink(
             delta
@@ -5277,13 +6405,15 @@ function animate() {
         // de dar la vuelta. Solo en espera y sin
         // interacción reciente con la cámara. Al hablar,
         // pensar o escuchar vuelve al frente para que se
-        // le vea la cara.
-        if (
-            currentStatus === 'waiting' &&
-            (elapsedTime - lastCameraInteraction) > SWAY_RESUME_DELAY
-        ) {
+        // le vea la cara. Durante el baile se congela.
+        if (!dancing) {
+
+            if (
+                currentStatus === 'waiting' &&
+                (elapsedTime - lastCameraInteraction) > SWAY_RESUME_DELAY
+            ) {
             const swayTarget =
-                SWAY_BASE_YAW +
+                avatarBaseYaw +
                 Math.sin(elapsedTime * SWAY_SPEED) * SWAY_AMPLITUDE;
 
             currentVrm.scene.rotation.y = smoothValue(
@@ -5295,15 +6425,21 @@ function animate() {
         } else if (currentStatus !== 'waiting') {
             currentVrm.scene.rotation.y = smoothValue(
                 currentVrm.scene.rotation.y,
-                SWAY_BASE_YAW,
+                avatarBaseYaw,
                 delta,
                 2
             );
         }
+        }
 
-        currentVrm.update(
-            delta
-        );
+        // Solo los VRM traen update() propio (expresiones,
+        // mirada, springbones); la fachada FBX no lo tiene.
+        if (typeof currentVrm.update === 'function') {
+
+            currentVrm.update(
+                delta
+            );
+        }
     }
 
     updateCamTransition(delta);
